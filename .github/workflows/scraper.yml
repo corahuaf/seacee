@@ -1,6 +1,12 @@
 name: Ejecución Diaria de Scraper SEACE
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'scraper/**'
+      - '.github/workflows/scraper.yml'
   schedule:
     # Hora en formato UTC.
     # 08:00 AM UTC equivale a las 03:00 AM en Perú (UTC-5)
