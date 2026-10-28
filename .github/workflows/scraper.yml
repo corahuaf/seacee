@@ -1,0 +1,37 @@
+name: Ejecución Diaria de Scraper SEACE
+
+on:
+  schedule:
+    # Hora en formato UTC.
+    # 08:00 AM UTC equivale a las 03:00 AM en Perú (UTC-5)
+    - cron: '0 8 * * *'
+
+  # Esto te permite agregar un botón en GitHub para ejecutarlo manualmente cuando quieras
+  workflow_dispatch:
+
+jobs:
+  ejecutar-scraper:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar el código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Instalar dependencias
+        # npm ci es más rápido y limpio en entornos automatizados que npm install
+        run: npm ci
+
+      - name: Instalar dependencias del sistema para Puppeteer
+        # Puppeteer requiere algunas librerías gráficas en servidores Linux
+        run: npx puppeteer browsers install chrome
+
+      - name: Ejecutar el script de Puppeteer
+        run: node scraper/plantilla.js
+        env:
+          # Pasamos la URL de Vercel de forma segura
+          ENDPOINT_URL: ${{ secrets.ENDPOINT_URL }}
