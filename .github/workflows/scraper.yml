@@ -22,9 +22,12 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Verificar version de Node
+        run: node -v && npm -v
+
       - name: Instalar dependencias
         # npm ci es más rápido y limpio en entornos automatizados que npm install
-        run: npm ci
+        run: npm ci --engine-strict=false
 
       - name: Instalar dependencias del sistema para Puppeteer
         # Puppeteer requiere algunas librerías gráficas en servidores Linux
