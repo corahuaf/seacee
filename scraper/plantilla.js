@@ -23,6 +23,47 @@ if (fs.existsSync('.env')) {
 const USER_AGENT =
 	'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 
+// ============================================================================
+// CONFIGURACIÓN DE PALABRAS CLAVE DE BÚSQUEDA Y FILTRADO
+// ============================================================================
+const PALABRAS_CLAVE_SEACE = [
+	'SIG',
+	'GIS',
+	'GEOGRAFICA',
+	'GEOGRAFICO',
+	'CATASTRO',
+	'CARTOGRAFIA',
+	'GEOMATICA',
+	'TELEDETECCION',
+	'ORDENAMIENTO TERRITORIAL',
+	'SISTEMAS',
+	'SOFTWARE',
+	'DESARROLLADOR',
+	'PROGRAMADOR',
+	'BASE DE DATOS',
+	'INFORMATICA'
+];
+
+const PALABRAS_CLAVE_SERVIR = [
+	'SISTEMAS',
+	'GEOGRAF',
+	'CATASTRO',
+	'CARTOGRAF',
+	'GEOMATICA',
+	'SOFTWARE',
+	'PROGRAMADOR',
+	'DESARROLLADOR',
+	'BASE DE DATOS'
+];
+
+// Expresión regular amplia para validar que el texto del servicio/convocatoria coincida con tu perfil
+const REGEX_FILTRO_PERFIL =
+	/\bsig\b|\bgis\b|geogr[aá]f|catastr|cartogr[aá]f|geom[aá]tic|teledetecci|fotogrametr|geoespacial|espacial|territorial|arcgis|qgis|postgis|geoportal|sistema de informaci|software|programador|desarrollador|frontend|fullstack|backend|aplicaciones web|inform[aá]tic|base de datos|analista de datos|ciencia de datos|python|angular|typescript|node/i;
+
+// Excluir contrataciones de obras físicas, alquiler de vehículos o servicios ajenos que mencionan "sistema" o "catastro" solo en el nombre del proyecto
+const REGEX_EXCLUIR_RUIDO =
+	/alquiler de camioneta|desmontaje|alcantarillado pluvial|verificador de calicatas|redaccion y\/u ortograf|especialista de presupuesto|mantenimiento de aire acondicionado|sistema el[eé]ctrico|sistema contra incendios/i;
+
 const SYSTEM_INSTRUCTION = `Actúa como un evaluador experto en selección y contratación para el Estado Peruano (CAS, Locación de Servicios, Órdenes de Servicio en SEACE/SERVIR/IGN/IGP).
 Evalúa los Términos de Referencia (TDR) o bases de la convocatoria frente al siguiente perfil profesional:
 - Especialista en Sistemas de Información Geográfica (SIG), ArcGIS, QGIS, bases de datos espaciales (PostGIS).
@@ -134,13 +175,21 @@ async function evaluarYGuardarDirecto(datos) {
 
 	const cleanedText = (response.text || '{}').replace(/```(?:json)?/gi, '').trim();
 	const evaluacion = JSON.parse(cleanedText);
+	const puntaje = Number(evaluacion.porcentaje_compatibilidad) || 0;
+
+	if (puntaje < 25) {
+		return {
+			success: true,
+			message: `Descartada por baja compatibilidad (${puntaje}%)`
+		};
+	}
 
 	const { error } = await supabase.from('oportunidades').insert({
 		titulo: datos.titulo,
 		entidad: datos.entidad,
 		fecha_cierre: datos.fecha_cierre,
 		enlace_bases: datos.enlace_bases,
-		porcentaje_compatibilidad: Number(evaluacion.porcentaje_compatibilidad) || 0,
+		porcentaje_compatibilidad: puntaje,
 		cumple_perfil_minimo: Boolean(evaluacion.cumple_perfil_minimo),
 		puntos_fuertes: Array.isArray(evaluacion.puntos_fuertes) ? evaluacion.puntos_fuertes : [],
 		brechas_o_faltantes: Array.isArray(evaluacion.brechas_o_faltantes)
@@ -150,7 +199,7 @@ async function evaluarYGuardarDirecto(datos) {
 	});
 
 	if (error) throw error;
-	return { success: true, match: evaluacion.porcentaje_compatibilidad };
+	return { success: true, match: puntaje };
 }
 
 async function enviarOportunidad(payload, backendUrl) {
@@ -190,12 +239,11 @@ async function enviarOportunidad(payload, backendUrl) {
 // ============================================================================
 async function scrapearSEACE() {
 	console.log('\n🌐 [1/4] Consultando SEACE (Buscador Público de Contrataciones <= 8 UIT)...');
-	const oportunidades = [];
-	const palabras = ['SIG', 'GEOGRAFICA', 'SISTEMAS'];
+	const mapaUnicas = new Map();
 
-	for (const palabra of palabras) {
+	for (const palabra of PALABRAS_CLAVE_SEACE) {
 		try {
-			const url = `https://prod6.seace.gob.pe/v1/s8uit-services/buscadorpublico/contrataciones/buscador?anio=2026&palabra_clave=${encodeURIComponent(palabra)}&orden=2&page=1&page_size=5`;
+			const url = `https://prod6.seace.gob.pe/v1/s8uit-services/buscadorpublico/contrataciones/buscador?anio=2026&palabra_clave=${encodeURIComponent(palabra)}&orden=2&page=1&page_size=15`;
 			const res = await fetch(url, { headers: { 'User-Agent': USER_AGENT } });
 			if (!res.ok) continue;
 
@@ -203,30 +251,31 @@ async function scrapearSEACE() {
 			const lista = json.data || [];
 
 			for (const item of lista) {
-				if (item.nomEstadoContrato && item.nomEstadoContrato !== 'Vigente') continue;
+				if (item.nomEstadoContrato && !/vigente|publicado/i.test(item.nomEstadoContrato)) continue;
 				const desc = item.desObjetoContrato || '';
-				// Filtrar que sea realmente de SIG, Sistemas, Software o Desarrollo (usando \bsig\b para no coincidir con "asignada")
-				if (
-					!/\bsig\b|geogr|sistema|software|programador|desarrollador|informátic|informatic|base de datos|catastro/i.test(
-						desc
-					)
-				) {
+				if (!REGEX_FILTRO_PERFIL.test(desc) || REGEX_EXCLUIR_RUIDO.test(desc)) {
 					continue;
 				}
-				oportunidades.push({
-					titulo: `${item.desContratacion}: ${desc.slice(0, 110)}`,
-					entidad: item.nomEntidad || 'Entidad en SEACE',
-					fecha_cierre: item.fecFinCotizacion || 'Vigente',
-					enlace_bases: 'https://prod6.seace.gob.pe/buscador-publico/contrataciones',
-					texto_tdr: `Contratación SEACE: ${item.desContratacion}\nTipo: ${item.nomObjetoContrato}\nEntidad: ${item.nomEntidad}\nInicio cotización: ${item.fecIniCotizacion}\nFin cotización: ${item.fecFinCotizacion}\nDescripción completa del requerimiento:\n${desc}`
-				});
+				const titulo = `${item.desContratacion}: ${desc.slice(0, 110)}`;
+				const entidad = item.nomEntidad || 'Entidad en SEACE';
+				const clave = `${titulo}||${entidad}`;
+				if (!mapaUnicas.has(clave)) {
+					mapaUnicas.set(clave, {
+						titulo,
+						entidad,
+						fecha_cierre: item.fecFinCotizacion || 'Vigente',
+						enlace_bases: 'https://prod6.seace.gob.pe/buscador-publico/contrataciones',
+						texto_tdr: `Contratación SEACE: ${item.desContratacion}\nTipo: ${item.nomObjetoContrato}\nEntidad: ${item.nomEntidad}\nInicio cotización: ${item.fecIniCotizacion}\nFin cotización: ${item.fecFinCotizacion}\nDescripción completa del requerimiento:\n${desc}`
+					});
+				}
 			}
 		} catch (err) {
 			console.log(`  ⚠️ Error en SEACE (${palabra}):`, err.message);
 		}
 	}
-	console.log(`  📌 SEACE: ${oportunidades.length} contrataciones relevantes encontradas.`);
-	return oportunidades.slice(0, 4);
+	const oportunidades = [...mapaUnicas.values()];
+	console.log(`  📌 SEACE: ${oportunidades.length} contrataciones relevantes únicas encontradas.`);
+	return oportunidades;
 }
 
 // ============================================================================
@@ -263,7 +312,7 @@ async function scrapearIGN(browser) {
 
 		console.log(`  📌 IGN: ${filas.length} convocatorias encontradas.`);
 
-		for (const fila of filas.slice(0, 2)) {
+		for (const fila of filas.slice(0, 6)) {
 			const textoPdf = await extraerTextoPDF(fila.urlPdf);
 			oportunidades.push({
 				titulo: fila.titulo,
@@ -300,18 +349,19 @@ async function scrapearIGP() {
 		const data = await res.json();
 		const lista = data.convocatoria || [];
 
-		// Filtrar vigentes o recientes relacionadas a Sistemas, Geoespacio, TI o Ingeniería
+		// Filtrar vigentes o recientes relacionadas al perfil ampliado
 		const vigentes = lista.filter(
 			(c) =>
 				c.estadoConvocatoria === 'Vigente' &&
-				/sistema|geoespacio|geof|comput|informátic|informatic|datos|software|electr|ingenier/i.test(
-					`${c.descripcion} ${c.formacionAcademica} ${c.dependencia}`
-				)
+				(REGEX_FILTRO_PERFIL.test(`${c.descripcion} ${c.formacionAcademica} ${c.dependencia}`) ||
+					/geof|comput|datos|electr|ingenier/i.test(
+						`${c.descripcion} ${c.formacionAcademica} ${c.dependencia}`
+					))
 		);
 
 		console.log(`  📌 IGP: ${vigentes.length} convocatorias vigentes afines encontradas.`);
 
-		for (const c of vigentes.slice(0, 2)) {
+		for (const c of vigentes.slice(0, 6)) {
 			const urlBases = c.pdfViewer
 				? `https://www.igp.gob.pe/convocatorias${c.pdfViewer}`
 				: 'https://www.igp.gob.pe/convocatorias/';
@@ -337,7 +387,7 @@ async function scrapearIGP() {
 async function scrapearSERVIR(browser) {
 	console.log('\n🏛️ [4/4] Consultando SERVIR - Talento Perú...');
 	const page = await browser.newPage();
-	const oportunidades = [];
+	const mapaUnicas = new Map();
 
 	try {
 		await page.setUserAgent(USER_AGENT);
@@ -346,60 +396,85 @@ async function scrapearSERVIR(browser) {
 			{ waitUntil: 'networkidle2', timeout: 35000 }
 		);
 
-		// Buscar por puesto "SISTEMAS"
-		await page.type('[id="frmLstOfertsLabo:txtPuesto"]', 'SISTEMAS');
-		await page.click('[id="frmLstOfertsLabo:j_idt46"]');
-		await new Promise((r) => setTimeout(r, 4000));
-
-		const cuadros = await page.evaluate(() => {
-			const items = [];
-			const vacantes = document.querySelectorAll('.cuadro-vacantes');
-			vacantes.forEach((box) => {
-				const texto = box.innerText.replace(/\s+/g, ' ').trim();
-				const lineas = box.innerText
-					.split('\n')
-					.map((l) => l.trim())
-					.filter(Boolean);
-				const titulo = lineas[0] || 'Convocatoria SERVIR';
-				const entidad = lineas[1] || 'Entidad del Estado';
-				const matchFecha = texto.match(/Fecha Fin de Publicación:\s*([0-9/]+)/i);
-				const matchRemun = texto.match(/Remuneración:\s*([^F]+)/i);
-
-				items.push({
-					titulo,
-					entidad,
-					fecha_cierre: matchFecha ? matchFecha[1] : 'Vigente',
-					remuneracion: matchRemun ? matchRemun[1].trim() : '',
-					resumen: texto
+		for (const termino of PALABRAS_CLAVE_SERVIR) {
+			try {
+				await page.evaluate(() => {
+					const input = document.querySelector('[id="frmLstOfertsLabo:txtPuesto"]');
+					if (input) input.value = '';
 				});
-			});
-			return items;
-		});
+				await page.type('[id="frmLstOfertsLabo:txtPuesto"]', termino);
+				await page.click('[id="frmLstOfertsLabo:j_idt46"]');
+				await new Promise((r) => setTimeout(r, 3200));
 
-		console.log(`  📌 SERVIR: ${cuadros.length} ofertas encontradas en la primera vista.`);
+				const cuadros = await page.evaluate(() => {
+					const items = [];
+					const vacantes = document.querySelectorAll('.cuadro-vacantes');
+					vacantes.forEach((box) => {
+						const texto = box.innerText.replace(/\s+/g, ' ').trim();
+						const lineas = box.innerText
+							.split('\n')
+							.map((l) => l.trim())
+							.filter(Boolean);
+						const titulo = lineas[0] || 'Convocatoria SERVIR';
+						const entidad = lineas[1] || 'Entidad del Estado';
+						const matchFecha = texto.match(/Fecha Fin de Publicación:\s*([0-9/]+)/i);
+						const matchRemun = texto.match(/Remuneración:\s*([^F]+)/i);
 
-		for (const item of cuadros.slice(0, 2)) {
-			oportunidades.push({
-				titulo: item.titulo,
-				entidad: item.entidad,
-				fecha_cierre: item.fecha_cierre,
-				enlace_bases:
-					'https://app.servir.gob.pe/DifusionOfertasExterno/faces/consultas/ofertas_laborales.xhtml',
-				texto_tdr: `Oferta Laboral SERVIR Talento Perú:\nPuesto: ${item.titulo}\nEntidad: ${item.entidad}\nDetalle:\n${item.resumen}`
-			});
+						items.push({
+							titulo,
+							entidad,
+							fecha_cierre: matchFecha ? matchFecha[1] : 'Vigente',
+							remuneracion: matchRemun ? matchRemun[1].trim() : '',
+							resumen: texto
+						});
+					});
+					return items;
+				});
+
+				for (const item of cuadros.slice(0, 4)) {
+					const clave = `${item.titulo}||${item.entidad}`;
+					if (!mapaUnicas.has(clave)) {
+						mapaUnicas.set(clave, {
+							titulo: item.titulo,
+							entidad: item.entidad,
+							fecha_cierre: item.fecha_cierre,
+							enlace_bases:
+								'https://app.servir.gob.pe/DifusionOfertasExterno/faces/consultas/ofertas_laborales.xhtml',
+							texto_tdr: `Oferta Laboral SERVIR Talento Perú:\nPuesto: ${item.titulo}\nEntidad: ${item.entidad}\nDetalle:\n${item.resumen}`
+						});
+					}
+				}
+			} catch (subErr) {
+				console.log(`  ⚠️ Error buscando "${termino}" en SERVIR:`, subErr.message);
+			}
 		}
+
+		console.log(`  📌 SERVIR: ${mapaUnicas.size} ofertas únicas recolectadas.`);
 	} catch (err) {
 		console.log(`  ⚠️ Error en SERVIR:`, err.message);
 	} finally {
 		await page.close();
 	}
 
-	return oportunidades;
+	return [...mapaUnicas.values()];
 }
 
 // ============================================================================
 // ORQUESTADOR PRINCIPAL
 // ============================================================================
+async function obtenerClavesExistentes() {
+	const supaUrl = process.env.PUBLIC_SUPABASE_URL;
+	const supaKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+	if (!supaUrl || !supaKey) return new Set();
+	try {
+		const supabase = createClient(supaUrl, supaKey);
+		const { data } = await supabase.from('oportunidades').select('titulo, entidad');
+		return new Set((data || []).map((r) => `${r.titulo}||${r.entidad}`));
+	} catch {
+		return new Set();
+	}
+}
+
 async function iniciarScrapingMultiPortal() {
 	console.log('🚀 Iniciando Scraper Multi-Portal (SEACE + IGN + IGP + SERVIR)...');
 	const backendUrl = normalizarEndpointUrl(process.env.ENDPOINT_URL);
@@ -425,7 +500,8 @@ async function iniciarScrapingMultiPortal() {
 	let totalProcesadas = 0;
 
 	try {
-		const [opSeace, opIgn, opIgp, opServir] = await Promise.all([
+		const [existentes, opSeace, opIgn, opIgp, opServir] = await Promise.all([
+			obtenerClavesExistentes(),
 			scrapearSEACE(),
 			scrapearIGN(browser),
 			scrapearIGP(),
@@ -433,19 +509,26 @@ async function iniciarScrapingMultiPortal() {
 		]);
 
 		const todas = [...opIgn, ...opSeace, ...opIgp, ...opServir];
-		console.log(`\n📦 Total de oportunidades recolectadas de los 4 portales: ${todas.length}`);
+		const nuevas = todas.filter((op) => !existentes.has(`${op.titulo}||${op.entidad}`));
 
-		for (const op of todas) {
-			console.log(`\n➡️ Evaluando: ${op.titulo} (${op.entidad})`);
+		console.log(
+			`\n📦 Total recolectadas: ${todas.length} | Ya en base de datos: ${todas.length - nuevas.length} | Nuevas por evaluar: ${nuevas.length}`
+		);
+
+		// Evaluar hasta 15 oportunidades nuevas por ejecución para cuidar tiempos y límites
+		for (const op of nuevas.slice(0, 15)) {
+			console.log(`\n➡️ Evaluando nueva: ${op.titulo} (${op.entidad})`);
 			const ok = await enviarOportunidad(op, backendUrl);
 			if (ok) totalProcesadas++;
-			await new Promise((r) => setTimeout(r, 1500));
+			await new Promise((r) => setTimeout(r, 1200));
 		}
 	} catch (error) {
 		console.error('❌ Error general en el scraper:', error.message);
 	} finally {
 		await browser.close();
-		console.log(`\n🏁 Scraping Multi-Portal finalizado. Procesadas con éxito: ${totalProcesadas}`);
+		console.log(
+			`\n🏁 Scraping Multi-Portal finalizado. Nuevas procesadas con éxito: ${totalProcesadas}`
+		);
 	}
 }
 
