@@ -4,6 +4,9 @@ import { PDFParse } from 'pdf-parse';
 import { createClient } from '@supabase/supabase-js';
 import { GoogleGenAI } from '@google/genai';
 
+// Permitir certificados SSL de entidades gubernamentales (.gob.pe) que no incluyen cadena intermedia completa
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 // Cargar variables de .env si existe localmente
 if (fs.existsSync('.env')) {
 	const envContent = fs.readFileSync('.env', 'utf-8');
@@ -17,42 +20,14 @@ if (fs.existsSync('.env')) {
 	}
 }
 
-// URL oficial de la categoría de Ingeniería de Sistemas / Informática / Computación
-const BUSQUEDA_URL =
-	'https://www.convocatoriasdetrabajo.com/ofertas-de-empleo-para-INGENIEROS-DE-SISTEMAS-9.html';
-const MAX_CONVOCATORIAS_A_EVALUAR = 5;
+const USER_AGENT =
+	'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 
-const PALABRAS_CLAVE_PRIORIDAD = [
-	'sistema',
-	'informática',
-	'informatica',
-	'software',
-	'desarrollador',
-	'programador',
-	'sig',
-	'gis',
-	'geográfica',
-	'geografica',
-	'geomática',
-	'base de datos',
-	'datos',
-	'seguridad de la información',
-	'seguridad de la informacion',
-	'redes',
-	'web',
-	'tecnologías de la información',
-	'tecnologias de la informacion',
-	'soc',
-	'computación',
-	'computacion',
-	'digitador'
-];
-
-const SYSTEM_INSTRUCTION = `Actúa como un evaluador experto en selección y contratación para el Estado Peruano (CAS, Locación de Servicios, Órdenes de Servicio en SEACE/SERVIR).
+const SYSTEM_INSTRUCTION = `Actúa como un evaluador experto en selección y contratación para el Estado Peruano (CAS, Locación de Servicios, Órdenes de Servicio en SEACE/SERVIR/IGN/IGP).
 Evalúa los Términos de Referencia (TDR) o bases de la convocatoria frente al siguiente perfil profesional:
 - Especialista en Sistemas de Información Geográfica (SIG), ArcGIS, QGIS, bases de datos espaciales (PostGIS).
 - Desarrollador Frontend y Fullstack: Angular, TypeScript, Svelte, Node.js, Python.
-- Experiencia en el sector público peruano (JNE, Ministerios, Gobiernos Regionales/Locales).
+- Experiencia en el sector público peruano (JNE, Ministerios, Gobiernos Regionales/Locales, IGN, IGP).
 
 REGLAS DE SALIDA: Devuelve ÚNICAMENTE un objeto JSON válido con la siguiente estructura:
 {
@@ -78,6 +53,41 @@ function normalizarEndpointUrl(rawUrl) {
 	return url;
 }
 
+async function extraerTextoPDF(urlPdf) {
+	let parser = null;
+	try {
+		console.log(`  📄 Descargando y leyendo PDF: ${urlPdf}`);
+		const response = await fetch(urlPdf, {
+			headers: { 'User-Agent': USER_AGENT }
+		});
+
+		if (!response.ok) throw new Error(`HTTP status: ${response.status}`);
+
+		const contentType = (response.headers.get('content-type') || '').toLowerCase();
+		if (
+			!contentType.includes('pdf') &&
+			!urlPdf.toLowerCase().endsWith('.pdf') &&
+			!urlPdf.includes('Documento.aspx')
+		) {
+			return null;
+		}
+
+		const arrayBuffer = await response.arrayBuffer();
+		const buffer = Buffer.from(arrayBuffer);
+
+		parser = new PDFParse({ data: buffer });
+		const data = await parser.getText();
+		return data.text?.trim() || null;
+	} catch (error) {
+		console.log(`  ⚠️ No se pudo extraer PDF directo (${error.message}).`);
+		return null;
+	} finally {
+		if (parser) {
+			await parser.destroy();
+		}
+	}
+}
+
 async function evaluarYGuardarDirecto(datos) {
 	const supaUrl = process.env.PUBLIC_SUPABASE_URL;
 	const supaKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -90,7 +100,6 @@ async function evaluarYGuardarDirecto(datos) {
 	const supabase = createClient(supaUrl, supaKey);
 	const ai = new GoogleGenAI({ apiKey: geminiKey });
 
-	// Verificar si ya existe para no duplicar
 	const { data: existente } = await supabase
 		.from('oportunidades')
 		.select('id')
@@ -109,7 +118,7 @@ async function evaluarYGuardarDirecto(datos) {
 		try {
 			response = await ai.models.generateContent({
 				model,
-				contents: `Evalúa los siguientes TDR o bases de convocatoria:\nPuesto: ${datos.titulo}\nEntidad: ${datos.entidad}\nRequisitos:\n${datos.texto_tdr}`,
+				contents: `Evalúa los siguientes TDR o bases de convocatoria:\nPuesto/Servicio: ${datos.titulo}\nEntidad: ${datos.entidad}\nRequisitos/TDR:\n${datos.texto_tdr}`,
 				config: {
 					systemInstruction: SYSTEM_INSTRUCTION,
 					responseMimeType: 'application/json',
@@ -144,46 +153,257 @@ async function evaluarYGuardarDirecto(datos) {
 	return { success: true, match: evaluacion.porcentaje_compatibilidad };
 }
 
-async function extraerTextoPDF(urlPdf) {
-	let parser = null;
+async function enviarOportunidad(payload, backendUrl) {
+	let guardado = false;
 	try {
-		console.log(`  📄 Intentando descargar bases PDF: ${urlPdf}`);
-		const response = await fetch(urlPdf, {
-			headers: {
-				'User-Agent':
-					'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-			}
+		const respuesta = await fetch(backendUrl, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(payload)
 		});
-
-		if (!response.ok) throw new Error(`HTTP status: ${response.status}`);
-
-		const contentType = response.headers.get('content-type') || '';
-		if (!contentType.includes('pdf') && !urlPdf.toLowerCase().endsWith('.pdf')) {
-			return null;
+		const resultado = await respuesta.json();
+		if (respuesta.ok && resultado.success) {
+			console.log(`  ✅ Guardado vía API: ${resultado.message || 'OK'}`);
+			guardado = true;
+			return true;
 		}
+	} catch {
+		// Fallback a guardado directo si está en local o falló conexión al endpoint
+	}
 
-		const arrayBuffer = await response.arrayBuffer();
-		const buffer = Buffer.from(arrayBuffer);
-
-		parser = new PDFParse({ data: buffer });
-		const data = await parser.getText();
-		return data.text?.trim() || null;
-	} catch (error) {
-		console.log(
-			`  ⚠️ No se pudo parsear PDF directo (${error.message}). Se usará el resumen de requisitos de la web.`
-		);
-		return null;
-	} finally {
-		if (parser) {
-			await parser.destroy();
+	if (!guardado && process.env.GEMINI_API_KEY && process.env.PUBLIC_SUPABASE_URL) {
+		try {
+			const resDirecto = await evaluarYGuardarDirecto(payload);
+			console.log(
+				`  ✅ Evaluado y guardado en Supabase (${resDirecto.message || `Match: ${resDirecto.match}%`}).`
+			);
+			return true;
+		} catch (directErr) {
+			console.error(`  ❌ Error evaluando/guardando:`, directErr.message);
 		}
 	}
+	return false;
 }
 
-async function iniciarScraping() {
-	console.log('🤖 Iniciando Scraper de Convocatorias del Estado Peruano...');
+// ============================================================================
+// 1. SCRAPER: SEACE (https://prod6.seace.gob.pe/buscador-publico/contrataciones)
+// ============================================================================
+async function scrapearSEACE() {
+	console.log('\n🌐 [1/4] Consultando SEACE (Buscador Público de Contrataciones <= 8 UIT)...');
+	const oportunidades = [];
+	const palabras = ['SIG', 'GEOGRAFICA', 'SISTEMAS'];
+
+	for (const palabra of palabras) {
+		try {
+			const url = `https://prod6.seace.gob.pe/v1/s8uit-services/buscadorpublico/contrataciones/buscador?anio=2026&palabra_clave=${encodeURIComponent(palabra)}&orden=2&page=1&page_size=5`;
+			const res = await fetch(url, { headers: { 'User-Agent': USER_AGENT } });
+			if (!res.ok) continue;
+
+			const json = await res.json();
+			const lista = json.data || [];
+
+			for (const item of lista) {
+				if (item.nomEstadoContrato && item.nomEstadoContrato !== 'Vigente') continue;
+				const desc = item.desObjetoContrato || '';
+				// Filtrar que sea realmente de SIG, Sistemas, Software o Desarrollo (usando \bsig\b para no coincidir con "asignada")
+				if (
+					!/\bsig\b|geogr|sistema|software|programador|desarrollador|informátic|informatic|base de datos|catastro/i.test(
+						desc
+					)
+				) {
+					continue;
+				}
+				oportunidades.push({
+					titulo: `${item.desContratacion}: ${desc.slice(0, 110)}`,
+					entidad: item.nomEntidad || 'Entidad en SEACE',
+					fecha_cierre: item.fecFinCotizacion || 'Vigente',
+					enlace_bases: 'https://prod6.seace.gob.pe/buscador-publico/contrataciones',
+					texto_tdr: `Contratación SEACE: ${item.desContratacion}\nTipo: ${item.nomObjetoContrato}\nEntidad: ${item.nomEntidad}\nInicio cotización: ${item.fecIniCotizacion}\nFin cotización: ${item.fecFinCotizacion}\nDescripción completa del requerimiento:\n${desc}`
+				});
+			}
+		} catch (err) {
+			console.log(`  ⚠️ Error en SEACE (${palabra}):`, err.message);
+		}
+	}
+	console.log(`  📌 SEACE: ${oportunidades.length} contrataciones relevantes encontradas.`);
+	return oportunidades.slice(0, 4);
+}
+
+// ============================================================================
+// 2. SCRAPER: IGN - Instituto Geográfico Nacional (https://app8.ign.gob.pe/convocatoria/)
+// ============================================================================
+async function scrapearIGN(browser) {
+	console.log('\n🗺️ [2/4] Consultando IGN (Instituto Geográfico Nacional)...');
+	const page = await browser.newPage();
+	const oportunidades = [];
+
+	try {
+		await page.setUserAgent(USER_AGENT);
+		await page.goto('https://app8.ign.gob.pe/convocatoria/', {
+			waitUntil: 'domcontentloaded',
+			timeout: 30000
+		});
+
+		const filas = await page.evaluate(() => {
+			const trs = [...document.querySelectorAll('table tr')];
+			const items = [];
+			for (const tr of trs) {
+				const link = tr.querySelector('a');
+				const text = tr.innerText.replace(/\s+/g, ' ').trim();
+				// Tomar solo CONVOCATORIAS (no actas de resultados pasados)
+				if (link && text.toUpperCase().startsWith('CONVOCATORIA')) {
+					items.push({
+						titulo: link.innerText.replace(/\s+/g, ' ').trim(),
+						urlPdf: link.href
+					});
+				}
+			}
+			return items;
+		});
+
+		console.log(`  📌 IGN: ${filas.length} convocatorias encontradas.`);
+
+		for (const fila of filas.slice(0, 2)) {
+			const textoPdf = await extraerTextoPDF(fila.urlPdf);
+			oportunidades.push({
+				titulo: fila.titulo,
+				entidad: 'Instituto Geográfico Nacional (IGN)',
+				fecha_cierre: 'Según cronograma en bases',
+				enlace_bases: fila.urlPdf,
+				texto_tdr: textoPdf
+					? textoPdf.slice(0, 15000)
+					: `Convocatoria IGN: ${fila.titulo}. Revisar PDF adjunto en ${fila.urlPdf}`
+			});
+		}
+	} catch (err) {
+		console.log(`  ⚠️ Error en IGN:`, err.message);
+	} finally {
+		await page.close();
+	}
+
+	return oportunidades;
+}
+
+// ============================================================================
+// 3. SCRAPER: IGP - Instituto Geofísico del Perú (https://www.igp.gob.pe/convocatorias/)
+// ============================================================================
+async function scrapearIGP() {
+	console.log('\n🌋 [3/4] Consultando IGP (Instituto Geofísico del Perú)...');
+	const oportunidades = [];
+
+	try {
+		const res = await fetch('https://www.igp.gob.pe/api/convocatorias/v1/convocatorias', {
+			headers: { 'User-Agent': USER_AGENT }
+		});
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+		const data = await res.json();
+		const lista = data.convocatoria || [];
+
+		// Filtrar vigentes o recientes relacionadas a Sistemas, Geoespacio, TI o Ingeniería
+		const vigentes = lista.filter(
+			(c) =>
+				c.estadoConvocatoria === 'Vigente' &&
+				/sistema|geoespacio|geof|comput|informátic|informatic|datos|software|electr|ingenier/i.test(
+					`${c.descripcion} ${c.formacionAcademica} ${c.dependencia}`
+				)
+		);
+
+		console.log(`  📌 IGP: ${vigentes.length} convocatorias vigentes afines encontradas.`);
+
+		for (const c of vigentes.slice(0, 2)) {
+			const urlBases = c.pdfViewer
+				? `https://www.igp.gob.pe/convocatorias${c.pdfViewer}`
+				: 'https://www.igp.gob.pe/convocatorias/';
+
+			oportunidades.push({
+				titulo: `${c.nombre}: ${(c.descripcion || '').replace(/\s+/g, ' ').trim()}`,
+				entidad: `Instituto Geofísico del Perú (IGP) - ${c.dependencia || ''}`,
+				fecha_cierre: c.fechaFinConvocatoria || 'Vigente',
+				enlace_bases: urlBases,
+				texto_tdr: `Convocatoria: ${c.nombre}\nModalidad: ${c.tipoContrato}\nDependencia: ${c.dependencia}\nSede: ${c.sede}\nSubvención/Remuneración: S/ ${c.subvencion} (${c.subvencionText})\nDescripción: ${c.descripcion}\nFormación Académica y Requisitos: ${c.formacionAcademica}`
+			});
+		}
+	} catch (err) {
+		console.log(`  ⚠️ Error en IGP:`, err.message);
+	}
+
+	return oportunidades;
+}
+
+// ============================================================================
+// 4. SCRAPER: SERVIR Talento Perú (https://app.servir.gob.pe/DifusionOfertasExterno/faces/consultas/ofertas_laborales.xhtml)
+// ============================================================================
+async function scrapearSERVIR(browser) {
+	console.log('\n🏛️ [4/4] Consultando SERVIR - Talento Perú...');
+	const page = await browser.newPage();
+	const oportunidades = [];
+
+	try {
+		await page.setUserAgent(USER_AGENT);
+		await page.goto(
+			'https://app.servir.gob.pe/DifusionOfertasExterno/faces/consultas/ofertas_laborales.xhtml',
+			{ waitUntil: 'networkidle2', timeout: 35000 }
+		);
+
+		// Buscar por puesto "SISTEMAS"
+		await page.type('[id="frmLstOfertsLabo:txtPuesto"]', 'SISTEMAS');
+		await page.click('[id="frmLstOfertsLabo:j_idt46"]');
+		await new Promise((r) => setTimeout(r, 4000));
+
+		const cuadros = await page.evaluate(() => {
+			const items = [];
+			const vacantes = document.querySelectorAll('.cuadro-vacantes');
+			vacantes.forEach((box) => {
+				const texto = box.innerText.replace(/\s+/g, ' ').trim();
+				const lineas = box.innerText
+					.split('\n')
+					.map((l) => l.trim())
+					.filter(Boolean);
+				const titulo = lineas[0] || 'Convocatoria SERVIR';
+				const entidad = lineas[1] || 'Entidad del Estado';
+				const matchFecha = texto.match(/Fecha Fin de Publicación:\s*([0-9/]+)/i);
+				const matchRemun = texto.match(/Remuneración:\s*([^F]+)/i);
+
+				items.push({
+					titulo,
+					entidad,
+					fecha_cierre: matchFecha ? matchFecha[1] : 'Vigente',
+					remuneracion: matchRemun ? matchRemun[1].trim() : '',
+					resumen: texto
+				});
+			});
+			return items;
+		});
+
+		console.log(`  📌 SERVIR: ${cuadros.length} ofertas encontradas en la primera vista.`);
+
+		for (const item of cuadros.slice(0, 2)) {
+			oportunidades.push({
+				titulo: item.titulo,
+				entidad: item.entidad,
+				fecha_cierre: item.fecha_cierre,
+				enlace_bases:
+					'https://app.servir.gob.pe/DifusionOfertasExterno/faces/consultas/ofertas_laborales.xhtml',
+				texto_tdr: `Oferta Laboral SERVIR Talento Perú:\nPuesto: ${item.titulo}\nEntidad: ${item.entidad}\nDetalle:\n${item.resumen}`
+			});
+		}
+	} catch (err) {
+		console.log(`  ⚠️ Error en SERVIR:`, err.message);
+	} finally {
+		await page.close();
+	}
+
+	return oportunidades;
+}
+
+// ============================================================================
+// ORQUESTADOR PRINCIPAL
+// ============================================================================
+async function iniciarScrapingMultiPortal() {
+	console.log('🚀 Iniciando Scraper Multi-Portal (SEACE + IGN + IGP + SERVIR)...');
 	const backendUrl = normalizarEndpointUrl(process.env.ENDPOINT_URL);
-	console.log(`📡 Endpoint de evaluación configurado en: ${backendUrl}`);
+	console.log(`📡 Endpoint configurado: ${backendUrl}`);
 
 	const launchOptions = {
 		headless: true,
@@ -191,186 +411,42 @@ async function iniciarScraping() {
 			'--no-sandbox',
 			'--disable-setuid-sandbox',
 			'--disable-dev-shm-usage',
-			'--disable-accelerated-2d-canvas',
-			'--disable-gpu'
+			'--ignore-certificate-errors',
+			'--disable-blink-features=AutomationControlled'
 		]
 	};
 
-	// En macOS local, usar Google Chrome del sistema si existe
 	const macChromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 	if (process.platform === 'darwin' && fs.existsSync(macChromePath)) {
 		launchOptions.executablePath = macChromePath;
 	}
 
 	const browser = await puppeteer.launch(launchOptions);
-	let exitosos = 0;
+	let totalProcesadas = 0;
 
 	try {
-		const page = await browser.newPage();
-		await page.setUserAgent(
-			'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-		);
+		const [opSeace, opIgn, opIgp, opServir] = await Promise.all([
+			scrapearSEACE(),
+			scrapearIGN(browser),
+			scrapearIGP(),
+			scrapearSERVIR(browser)
+		]);
 
-		console.log(`🔍 Navegando a portal de convocatorias: ${BUSQUEDA_URL}`);
-		await page.goto(BUSQUEDA_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+		const todas = [...opIgn, ...opSeace, ...opIgp, ...opServir];
+		console.log(`\n📦 Total de oportunidades recolectadas de los 4 portales: ${todas.length}`);
 
-		// Extraemos la lista de convocatorias de la página de resultados
-		const listaConvocatorias = await page.evaluate(() => {
-			const items = [];
-			const titulos = document.querySelectorAll('h2.convocatoria__title a');
-
-			titulos.forEach((a) => {
-				const card =
-					a.closest('.convocatoria, article, div.relative') || a.parentElement?.parentElement;
-				const entidadEl =
-					card?.querySelector('.convocatoria__logo h3') || card?.querySelector('h3');
-				const infoEls = card?.querySelectorAll('.convocatoria__info p');
-
-				let fechaCierre = 'No especificada';
-				let requisitosResumen = '';
-
-				infoEls?.forEach((p) => {
-					const text = p.innerText.trim();
-					if (text.toLowerCase().includes('vigente hasta')) {
-						fechaCierre = text.replace(/vigente hasta:?/i, '').trim();
-					} else if (!requisitosResumen && text.length > 20) {
-						requisitosResumen = text;
-					}
-				});
-
-				if (a.href) {
-					items.push({
-						titulo: a.innerText.trim(),
-						urlDetalle: a.href,
-						entidad: entidadEl?.innerText.trim() || 'Entidad del Estado',
-						fechaCierre,
-						requisitosResumen
-					});
-				}
-			});
-
-			return items;
-		});
-
-		console.log(
-			`📋 Se encontraron ${listaConvocatorias.length} convocatorias vigentes en la página.`
-		);
-
-		// Priorizar puestos cuyo título contenga palabras clave de TI / Sistemas / SIG
-		const ordenadas = [...listaConvocatorias].sort((a, b) => {
-			const tituloA = a.titulo.toLowerCase();
-			const tituloB = b.titulo.toLowerCase();
-			const matchA = PALABRAS_CLAVE_PRIORIDAD.some((k) => tituloA.includes(k)) ? 1 : 0;
-			const matchB = PALABRAS_CLAVE_PRIORIDAD.some((k) => tituloB.includes(k)) ? 1 : 0;
-			return matchB - matchA;
-		});
-
-		const seleccion = ordenadas.slice(0, MAX_CONVOCATORIAS_A_EVALUAR);
-
-		for (const item of seleccion) {
-			console.log(`\n➡️ Analizando: ${item.titulo} (${item.entidad})`);
-
-			let textoTdr = item.requisitosResumen;
-			let enlaceBases = item.urlDetalle;
-
-			try {
-				const detallePage = await browser.newPage();
-				await detallePage.setUserAgent(
-					'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-				);
-
-				await detallePage.goto(item.urlDetalle, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-				const detalleInfo = await detallePage.evaluate(() => {
-					const requisitosDiv = document.querySelector(
-						'.requisitos, #requisitos + div, div[id*="requisitos"]'
-					);
-					const basesLink = document.querySelector(
-						'.bases a, .bases-card a, a[href*="pdf"], a[href*="bases"]'
-					);
-
-					return {
-						textoRequisitos: requisitosDiv?.innerText?.trim() || '',
-						urlBases: basesLink?.href || ''
-					};
-				});
-
-				await detallePage.close();
-
-				if (detalleInfo.textoRequisitos && detalleInfo.textoRequisitos.length > textoTdr.length) {
-					textoTdr = detalleInfo.textoRequisitos;
-				}
-
-				if (detalleInfo.urlBases) {
-					enlaceBases = detalleInfo.urlBases;
-					if (enlaceBases.toLowerCase().endsWith('.pdf')) {
-						const textoPdf = await extraerTextoPDF(enlaceBases);
-						if (textoPdf && textoPdf.length > 100) {
-							textoTdr = textoPdf.slice(0, 15000);
-						}
-					}
-				}
-			} catch (err) {
-				console.log(
-					`  ⚠️ No se pudo cargar detalle completo (${err.message}). Usando datos del listado.`
-				);
-			}
-
-			if (!textoTdr || textoTdr.length < 15) {
-				console.log(`  ⏩ Omitiendo: No se pudo obtener información de requisitos para evaluar.`);
-				continue;
-			}
-
-			const payload = {
-				titulo: item.titulo,
-				entidad: item.entidad,
-				fecha_cierre: item.fechaCierre,
-				enlace_bases: enlaceBases,
-				texto_tdr: textoTdr
-			};
-
-			// Intentar enviar al backend configurado (ENDPOINT_URL) y si falla usar respaldo directo
-			let guardado = false;
-			try {
-				console.log(`  🧠 Evaluando con Gemini...`);
-				const respuesta = await fetch(backendUrl, {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify(payload)
-				});
-
-				const resultado = await respuesta.json();
-				if (respuesta.ok && resultado.success) {
-					console.log(`  ✅ Guardado vía API (${backendUrl}): ${resultado.message || 'OK'}`);
-					guardado = true;
-					exitosos++;
-				} else {
-					console.log(`  ⚠️ Respuesta de API con error:`, resultado.error || respuesta.status);
-				}
-			} catch (err) {
-				console.log(`  ⚠️ No se pudo conectar a ${backendUrl} (${err.message}).`);
-			}
-
-			if (!guardado && process.env.GEMINI_API_KEY && process.env.PUBLIC_SUPABASE_URL) {
-				try {
-					const resDirecto = await evaluarYGuardarDirecto(payload);
-					console.log(
-						`  ✅ Evaluado y guardado directamente en Supabase (${resDirecto.message || `Match: ${resDirecto.match}%`}).`
-					);
-					exitosos++;
-				} catch (directErr) {
-					console.error(`  ❌ Error en guardado directo:`, directErr.message);
-				}
-			}
-
+		for (const op of todas) {
+			console.log(`\n➡️ Evaluando: ${op.titulo} (${op.entidad})`);
+			const ok = await enviarOportunidad(op, backendUrl);
+			if (ok) totalProcesadas++;
 			await new Promise((r) => setTimeout(r, 1500));
 		}
 	} catch (error) {
-		console.error('❌ Error durante el scraping:', error.message);
+		console.error('❌ Error general en el scraper:', error.message);
 	} finally {
 		await browser.close();
-		console.log(`\n🏁 Proceso finalizado. Oportunidades procesadas con éxito: ${exitosos}`);
+		console.log(`\n🏁 Scraping Multi-Portal finalizado. Procesadas con éxito: ${totalProcesadas}`);
 	}
 }
 
-iniciarScraping();
+iniciarScrapingMultiPortal();
