@@ -17,6 +17,33 @@ REGLAS DE SALIDA: Devuelve ÚNICAMENTE un objeto JSON válido con la siguiente e
   "resumen_evaluacion": string (síntesis de 2 a 3 oraciones con la recomendación)
 }`;
 
+const MODELOS_GEMINI = ['gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.8-flash'];
+
+/**
+ * @param {string} promptText
+ */
+async function generarEvaluacionConReintento(promptText) {
+	let ultimoError = null;
+	for (const model of MODELOS_GEMINI) {
+		try {
+			return await ai.models.generateContent({
+				model,
+				contents: promptText,
+				config: {
+					systemInstruction: SYSTEM_INSTRUCTION,
+					responseMimeType: 'application/json',
+					thinkingConfig: { thinkingBudget: 0 }
+				}
+			});
+		} catch (err) {
+			ultimoError = err;
+			const msg = err instanceof Error ? err.message : String(err);
+			console.warn(`Aviso: Falló modelo ${model} (${msg}). Probando siguiente...`);
+		}
+	}
+	throw ultimoError;
+}
+
 export async function POST({ request }) {
 	try {
 		const body = await request.json();
@@ -26,15 +53,25 @@ export async function POST({ request }) {
 			return json({ success: false, error: 'texto_tdr es requerido' }, { status: 400 });
 		}
 
+		// Evitar duplicados si ya existe la misma convocatoria para la misma entidad
+		const { data: existente } = await supabase
+			.from('oportunidades')
+			.select('id')
+			.eq('titulo', titulo || 'Sin título')
+			.eq('entidad', entidad || 'Entidad no especificada')
+			.maybeSingle();
+
+		if (existente) {
+			return json({
+				success: true,
+				message: 'Oportunidad ya registrada previamente (omitida para evitar duplicados)'
+			});
+		}
+
 		// Evaluamos el TDR con Gemini forzando respuesta JSON
-		const response = await ai.models.generateContent({
-			model: 'gemini-2.0-flash',
-			contents: `Evalúa los siguientes TDR o bases de convocatoria:\n${texto_tdr}`,
-			config: {
-				systemInstruction: SYSTEM_INSTRUCTION,
-				responseMimeType: 'application/json'
-			}
-		});
+		const response = await generarEvaluacionConReintento(
+			`Evalúa los siguientes TDR o bases de convocatoria:\nPuesto: ${titulo}\nEntidad: ${entidad}\nRequisitos:\n${texto_tdr}`
+		);
 
 		const rawText = response.text || '{}';
 		// Limpiamos en caso venga envuelto en bloques de código markdown
